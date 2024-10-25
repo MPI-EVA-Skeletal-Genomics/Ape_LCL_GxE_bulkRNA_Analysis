@@ -1,0 +1,1192 @@
+---
+title: "bulkRNA_pilot_comparative_DGE_analysis"
+author: Amy longin edited by christian gagnon
+output: html_document
+date: "2024-09-11"
+---
+
+```{r}
+## loading libraries and data ----
+library(data.table)
+library(tidyverse)
+library(rpart)
+library(edgeR)
+library(readxl)
+library(sva)
+library(dplyr)
+library(biomaRt)
+library(qqman)
+library(ggplot2)
+library(reshape)
+library(qvalue)
+library(minpack.lm)
+library(dplyr)
+library(fgsea)
+library(msigdbr)
+library(stringr)
+library(forcats)
+library(readr)
+library(rlang)
+library(corrplot)
+```
+
+```{r}
+
+counts_comp <- read.delim("/mnt/primevo/work/christian_gagnon/Ape_GxE_comparative/bulkRNAapes/data/counts_compar.txt")
+#counts_intra <- read.delim('~/Documents/vandy/LCL GxE pilot/bulkRNA_counts/counts_intra.txt')
+  #counts_chimp <- read.delim('~/Documents/vandy/LCL GxE pilot/bulkRNA_counts/counts_chimp.txt')
+  #counts_bonobo <- read.delim('~/Documents/vandy/LCL GxE pilot/bulkRNA_counts/counts_bonobo.txt')
+  #counts_gorilla <- read.delim('~/Documents/vandy/LCL GxE pilot/bulkRNA_counts/counts_gorilla.txt')
+  #counts_orang <- read.delim('~/Documents/vandy/LCL GxE pilot/bulkRNA_counts/counts_orangutan.txt')
+lcl_metadata <- read.delim("/mnt/primevo/work/christian_gagnon/Ape_GxE_comparative/bulkRNAapes/data/pilot_data_bulkrna_metadata_compar.csv", sep = ",")
+```
+
+write.csv(lcl_metadata2, file="/mnt/primevo/work/christian_gagnon/Ape_GxE_comparative/bulkRNAapes/data/lcl_metadata2.csv")
+write.csv(counts_comp3, file="/mnt/primevo/work/christian_gagnon/Ape_GxE_comparative/bulkRNAapes/data/counts_comp3.csv")
+```{r}
+## modifying data frames to make them more usable ----
+# metadata
+lcl_metadata2 <- lcl_metadata %>%
+  filter(sample %in% colnames(counts_comp))
+```
+
+```{r}
+# mutating the columns of interest and control variables into factors
+cols <- c("sample_details", "taxon", "sex", "treatment", "treatment_type",
+          "treatment_solvent", "culture_plate_batch", "rna_plate_batch")
+lcl_metadata2[cols] <- lapply(lcl_metadata2[cols], factor)
+```
+
+```{r}
+# grabbing only protein coding genes
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+protein_coding_genes <- getBM(
+  attributes = c("external_gene_name", "gene_biotype"),
+  filters = "biotype",
+  values = "protein_coding",
+  mart = ensembl
+)
+protein_coding_gene_ids <- protein_coding_genes$external_gene_name
+counts_comp2 <- counts_comp[rownames(counts_comp) %in% protein_coding_gene_ids, ]
+```
+
+```{r}
+## running the initial DGE functions on counts_comp2 for initial filtering ----
+dge <- DGEList(counts_comp2) #Creates a DGEList object from a table of counts (rows=features, columns=samples)
+dge <- calcNormFactors(dge) #Calculate normalization factors to scale the raw library sizes. 
+cpm <- as.data.frame(cpm(dge, normalized.lib.sizes = TRUE)) #Computes counts per million (CPM) or reads per kilobase per million (RPKM) values.
+cpm$median <- apply(cpm, 1, median) #filtering out lowly expressed genes
+cpm2 <- cpm %>%
+  filter(median >= 1)
+counts_comp3 <- subset(counts_comp2, rownames(counts_comp2) %in% rownames(cpm2))
+v <- voom(counts_comp3) #Transform count data to log2-counts per million (logCPM), estimate the mean-variance relationship and use this to compute appropriate observational-level weights. The data are then ready for linear modelling. 
+norm_expression <- as.data.frame(v$E)
+```
+
+```{r}
+#Testing the efficacy of our filtration and normalization methods. Had to remove vitamin A treatment sample due to missing data for one of the samples. 
+lcl_metadata3 <- lcl_metadata2[-c(20, 35, 44, 59, 68, 83, 92), ]
+counts_comp4 <- counts_comp3[, -c(20, 35, 44, 59, 68, 83, 92) ]
+dge_disp <- DGEList(counts_comp4)
+mm <- model.matrix(~treatment+taxon+sex, data = lcl_metadata3)
+mm2 <- mm[, -c(12)]
+tmp <- voom(counts_comp4, mm, plot = T)
+```
+
+```{r}
+#Estimating common dispersion and tagwise dispersions in one run
+disp <- estimateDisp(dge_disp,mm2, robust = TRUE)
+plotBCV(disp) #Visualize dispersion estimates
+```
+
+```{r}
+#Using quasi-likelihood (QL) methods to account for gene-specific variability from both biological and technical sources
+fit <- glmQLFit(disp,mm2, robust = TRUE)
+qlf <- glmQLFTest(fit,coef=2)
+topTags(qlf)
+plotQLDisp(fit) #Visualizing QL dispersion
+```
+
+```{r}
+#Standard Linear model for good measure and comparison. Note: This is not the appropriate analysis for our data
+fit2 <- glmFit(disp,mm2, robust = TRUE)
+lrt <- glmLRT(fit2,coef=2)
+topTags(lrt)
+```
+```{r}
+#Heat map clustering *unfinished*
+#Tutorial: http://bioconductor.statistik.tu-dortmund.de/packages/3.9/workflows/vignettes/RnaSeqGeneEdgeRQL/inst/doc/edgeRQL.html#
+#This produces a matrix of log2 counts-per-million (logCPM), with undefined values avoided and the poorly defined log-fold-changes for low counts shrunk towards zero. 
+logCPM <- cpm(dge, prior.count=2, log=TRUE)
+rownames(logCPM) <- dge$genes$Symbol
+colnames(logCPM) <- paste(dge$samples$group, 1:2, sep="-")
+
+#stopped here:
+B.LvsP <- makeContrasts(B.lactating-B.pregnant, levels=design)
+
+tr <- glmTreat(fit, contrast=B.LvsP, lfc=log2(1.5))
+
+o <- order(tr$table$PValue)
+logCPM <- logCPM[o[1:30],]
+```
+
+
+```{r}
+####Alternative filtering strategy Not using##########
+## running the initial DGE functions on counts_comp2 for initial filtering ----
+
+#dgealt <- DGEList(counts_comp2)
+#dgealt2 <- calcNormFactors(dgealt)
+#cutoff <- 1
+#drop <- which(apply(cpm(dgealt2, normalized.lib.sizes = TRUE), 1, median) < cutoff)
+#dgealt3 <- dgealt2[-drop,] 
+#norm_expressionalt <- as.data.frame(dgealt3)
+```
+
+```{r}
+# making a matrix for each treatment based on the filtered counts_comp matrix
+CO1_treatments <- c("BAFF", "IGF1", "BPA", "CU", "GLC", "CAF")
+CO2_treatments <- c("APAP", "ALD", "TUNIC", "VITA")
+```
+
+```{r}
+# creating a control matrix (raw counts)
+CO1_counts <- counts_comp3 %>%
+  dplyr::select(contains(c("CO1")))
+CO2_counts <- counts_comp3 %>%
+  dplyr::select(contains(c("CO2")))
+
+```
+
+```{r}
+# creating a control matrix (normalized counts)
+CO1_counts_norm <- norm_expression %>%
+  dplyr::select(contains(c("CO1")))
+CO2_counts_norm <- norm_expression %>%
+  dplyr::select(contains(c("CO2")))
+```
+
+```{r}
+for (treatment in CO1_treatments) {
+  treatment_matrix <- counts_comp3[,grepl(treatment, colnames(counts_comp3))]
+  
+  treatment_matrix <- merge(treatment_matrix, CO1_counts, by = "row.names")
+  
+  assign(paste0(treatment, "_matrix"), treatment_matrix)
+}
+```
+
+```{r}
+for (treatment in CO2_treatments) {
+  treatment_matrix <- counts_comp3[,grepl(treatment, colnames(counts_comp3))]
+  
+  treatment_matrix <- merge(treatment_matrix, CO2_counts, by = "row.names")
+  
+  assign(paste0(treatment, "_matrix"), treatment_matrix)
+}
+```
+
+```{r}
+# making a metadata matrix for each treatment
+treatments <- c("BAFF", "IGF1", "BPA", "CU", "GLC", "CAF", "APAP", 
+                "ALD", "TUNIC", "VITA")
+```
+
+
+```{r}
+for (treatment in treatments) {
+  treatment_matrix <- paste0(treatment, "_matrix")
+  
+  treatment_matrix <- get(treatment_matrix)
+  
+  metadata <- lcl_metadata %>%
+    filter(sample %in% colnames(treatment_matrix))
+  
+  assign(paste0(treatment, "_metadata"), metadata)
+}
+```
+
+```{r}
+## now running the DGE on each treatment matrix ----
+# creating the function
+DGEanalysis <- function(counts_matrix, metadata) {
+  dge2 <- DGEList(counts_matrix) #this now done on individual CO1/CO2//treatment counts matrices (filtered)
+  dge2 <- calcNormFactors(dge2)
+  model <- model.matrix(~treatment+taxon+sex, data = metadata)
+  v <- voom(dge2, model, plot = F)
+  fit <- lmFit(v, model) #lmFit fits a linear model using weighted least squares for each gene
+  fit <- eBayes(fit)  #Empirical Bayes smoothing of standard errors (shrinks standard errors that are much larger or smaller than those from other genes towards the average standard error)
+  p.values <- as.data.frame(fit$p.value[,2])
+  sex.pval <- as.data.frame(fit$p.value[,2])
+  betas <- as.data.frame(fit$coefficients[,2])
+  sex_effects <- as.data.frame(fit$coefficients[,7])
+  SEs <- as.data.frame(fit$stdev.unscaled[,2]*fit$sigma)
+  results <- cbind(p.values, betas, SEs, sex_effects, sex.pval)
+  colnames(results) <- c("p.value", "beta", "SE", "sex_effects", "sex.pval")
+  results$adj.pval <- p.adjust(results$p.value, method = "fdr")
+  results$sig <- ifelse(results$adj.pval < 0.05, "sig", "not_sig")
+  
+  row.names(results) <- row.names(counts_comp3)
+  
+  return(results)
+}
+```
+
+```{r}
+# creating a loop to run the function
+for (treatment in treatments) {
+  treatment_matrix <- paste0(treatment, "_matrix")
+  
+  treatment_matrix <- get(treatment_matrix)
+  
+  metadata_name <- paste0(treatment, "_metadata")
+  
+  treatment_matrix_metadata <- get(metadata_name)
+  
+  results <- DGEanalysis(treatment_matrix, treatment_matrix_metadata)
+  
+  assign(paste0(treatment, "_results"), results)
+}
+```
+
+```{r}
+#saving dataframe for model ~treatment+sex
+write.csv(VITA_results, file="/mnt/primevo/work/christian_gagnon/Ape_GxE_comparative/bulkRNAapes/data/VITA_results.csv")
+write.csv(ALD_results, file="/mnt/primevo/work/christian_gagnon/Ape_GxE_comparative/bulkRNAapes/data/ALD_results.csv")
+write.csv(APAP_results, file="/mnt/primevo/work/christian_gagnon/Ape_GxE_comparative/bulkRNAapes/data/APAP_results.csv")
+write.csv(BAFF_results, file="/mnt/primevo/work/christian_gagnon/Ape_GxE_comparative/bulkRNAapes/data/BAFF_results.csv")
+write.csv(BPA_results, file="/mnt/primevo/work/christian_gagnon/Ape_GxE_comparative/bulkRNAapes/data/BPA_results.csv")
+write.csv(CAF_results, file="/mnt/primevo/work/christian_gagnon/Ape_GxE_comparative/bulkRNAapes/data/CAF_results.csv")
+write.csv(CU_results, file="/mnt/primevo/work/christian_gagnon/Ape_GxE_comparative/bulkRNAapes/data/CU_results.csv")
+write.csv(GLC_results, file="/mnt/primevo/work/christian_gagnon/Ape_GxE_comparative/bulkRNAapes/data/GLC_results.csv")
+write.csv(IGF1_results, file="/mnt/primevo/work/christian_gagnon/Ape_GxE_comparative/bulkRNAapes/data/IGF1_results.csv")
+write.csv(TUNIC_results, file="/mnt/primevo/work/christian_gagnon/Ape_GxE_comparative/bulkRNAapes/data/TUNIC_results.csv")
+```
+
+```{r}
+## quick set of results (DGE analysis) ----
+
+# ALD
+sum(ALD_results$p.value < 0.05)
+  #2713 significant genes
+sum(ALD_results$adj.pval < 0.05)
+  #802 significant genes
+sum(ALD_results$adj.pval < 0.10)
+  #1587 significant genes
+
+# APAP
+sum(APAP_results$p.value < 0.05)
+  #2813 significant gene
+sum(APAP_results$adj.pval < 0.05)
+  #625 significant genes
+sum(APAP_results$adj.pval < 0.10)
+  #1497 significant genes
+
+# BAFF
+sum(BAFF_results$p.value < 0.05)
+  #1920 significant gene
+sum(BAFF_results$adj.pval < 0.05)
+  #117 significant genes
+sum(BAFF_results$adj.pval < 0.10)
+  #371 significant genes
+
+# BPA
+sum(BPA_results$p.value < 0.05)
+  #2501 significant gene
+sum(BPA_results$adj.pval < 0.05)
+  #665 significant genes
+sum(BPA_results$adj.pval < 0.10)
+  #1389 significant genes
+
+# CAF
+sum(CAF_results$p.value < 0.05)
+  #1586 significant gene
+sum(CAF_results$adj.pval < 0.05)
+  #48 significant genes
+sum(CAF_results$adj.pval < 0.10)
+  #237 significant genes
+
+# CU
+sum(CU_results$p.value < 0.05)
+  #2913 significant gene
+sum(CU_results$adj.pval < 0.05)
+  #1236 significant genes
+sum(CU_results$adj.pval < 0.10)
+  #2011 significant genes
+
+# GLC
+sum(GLC_results$p.value < 0.05)
+  #2789 significant gene
+sum(GLC_results$adj.pval < 0.05)
+  #1142 significant genes
+sum(GLC_results$adj.pval < 0.10)
+  #1877 significant genes
+
+# IGF1
+sum(IGF1_results$p.value < 0.05)
+  #1808 significant gene
+sum(IGF1_results$adj.pval < 0.05)
+  #95 significant genes
+sum(IGF1_results$adj.pval < 0.10)
+  #322 significant genes
+
+# TUNIC
+sum(TUNIC_results$p.value < 0.05)
+  #2828 significant gene
+sum(TUNIC_results$adj.pval < 0.05)
+  #813 significant genes
+sum(TUNIC_results$adj.pval < 0.10)
+  #1732 significant genes
+
+# VITA
+sum(VITA_results$p.value < 0.05)
+  #1763 significant gene
+sum(VITA_results$adj.pval < 0.05)
+  #0 significant genes
+sum(VITA_results$adj.pval < 0.10)
+  #0 significant genes
+```
+
+```{r}
+## making volcano plots!! ----
+# ALD
+ggplot(ALD_results, aes(beta, -log10(p.value), color = sig)) +
+  geom_point(size = 2, alpha = 0.6) +
+  theme_classic(base_size = 20) +
+  theme(legend.position = "none") +
+  xlab("Beta") +
+  ylab("-log10 p-value") +
+  labs(title = "ALD")
+
+# APAP
+ggplot(APAP_results, aes(beta, -log10(p.value), color = sig)) +
+  geom_point(size = 2, alpha = 0.6) +
+  theme_classic(base_size = 20) +
+  theme(legend.position = "none") +
+  xlab("Beta") +
+  ylab("-log10 p-value") +
+  labs(title = "APAP")
+
+# BAFF
+ggplot(BAFF_results, aes(beta, -log10(p.value), color = sig)) +
+  geom_point(size = 2, alpha = 0.6) +
+  theme_classic(base_size = 20) +
+  theme(legend.position = "none") +
+  xlab("Beta") +
+  ylab("-log10 p-value") +
+  labs(title = "BAFF")
+
+# BPA
+ggplot(BPA_results, aes(beta, -log10(p.value), color = sig)) +
+  geom_point(size = 2, alpha = 0.6) +
+  theme_classic(base_size = 20) +
+  theme(legend.position = "none") +
+  xlab("Beta") +
+  ylab("-log10 p-value") +
+  labs(title = "BPA")
+
+# CAF
+ggplot(CAF_results, aes(beta, -log10(p.value), color = sig)) +
+  geom_point(size = 2, alpha = 0.6) +
+  theme_classic(base_size = 20) +
+  theme(legend.position = "none") +
+  xlab("Beta") +
+  ylab("-log10 p-value") +
+  labs(title = "CAF")
+
+# CU
+ggplot(CU_results, aes(beta, -log10(p.value), color = sig)) +
+  geom_point(size = 2, alpha = 0.6) +
+  theme_classic(base_size = 20) +
+  theme(legend.position = "none") +
+  xlab("Beta") +
+  ylab("-log10 p-value") +
+  labs(title = "CU")
+
+# GLC
+ggplot(GLC_results, aes(beta, -log10(p.value), color = sig)) +
+  geom_point(size = 2, alpha = 0.6) +
+  theme_classic(base_size = 20) +
+  theme(legend.position = "none") +
+  xlab("Beta") +
+  ylab("-log10 p-value") +
+  labs(title = "GLC")
+
+# IGF1
+ggplot(IGF1_results, aes(beta, -log10(p.value), color = sig)) +
+  geom_point(size = 2, alpha = 0.6) +
+  theme_classic(base_size = 20) +
+  theme(legend.position = "none") +
+  xlab("Beta") +
+  ylab("-log10 p-value") +
+  labs(title = "IGF1")
+
+# TUNIC
+ggplot(TUNIC_results, aes(beta, -log10(p.value), color = sig)) +
+  geom_point(size = 2, alpha = 0.6) +
+  theme_classic(base_size = 20) +
+  theme(legend.position = "none") +
+  xlab("Beta") +
+  ylab("-log10 p-value") +
+  labs(title = "TUNIC")
+
+# VITA
+ggplot(VITA_results, aes(beta, -log10(p.value), color = sig)) +
+  geom_point(size = 2, alpha = 0.6) +
+  theme_classic(base_size = 20) +
+  theme(legend.position = "none") +
+  xlab("Beta") +
+  ylab("-log10 p-value") +
+  labs(title = "VITA")
+```
+
+
+```{r}
+## finding number of genes shared across treatments ----
+# filtering the dfs for just significantly expressed genes
+ALD_results2 <- ALD_results %>%
+  filter(p.value < 0.05)
+
+APAP_results2 <- APAP_results %>%
+  filter(p.value < 0.05)
+
+BAFF_results2 <- BAFF_results %>%
+  filter(p.value < 0.05)
+
+BPA_results2 <- BPA_results %>%
+  filter(p.value < 0.05)
+
+CAF_results2 <- CAF_results %>%
+  filter(p.value < 0.05)
+
+CU_results2 <- CU_results %>%
+  filter(p.value < 0.05)
+
+GLC_results2 <- GLC_results %>%
+  filter(p.value < 0.05)
+
+IGF1_results2 <- IGF1_results %>%
+  filter(p.value < 0.05)
+
+TUNIC_results2 <- TUNIC_results %>%
+  filter(p.value < 0.05)
+
+VITA_results2 <- VITA_results %>%
+  filter(p.value < 0.05)
+```
+
+```{r}
+# now merging them to find the number of genes
+shared_genes <- Reduce(intersect, list(rownames(ALD_results2), 
+                                       rownames(APAP_results2), 
+                                       rownames(BAFF_results2), 
+                                       rownames(BPA_results2),
+                                       rownames(CAF_results2),
+                                       rownames(CU_results2), 
+                                       rownames(GLC_results2),
+                                       rownames(IGF1_results2),
+                                       rownames(TUNIC_results2),
+                                       rownames(VITA_results2)))
+```
+
+
+```{r}
+## doing a correlation analyses of the different treatments
+counts_comp_results <- data.frame(row.names = row.names(counts_comp3),
+                                  ALD_betas = ALD_results$beta,
+                                  APAP_betas = APAP_results$beta,
+                                  BAFF_betas = BAFF_results$beta,
+                                  BPA_betas = BPA_results$beta,
+                                  CAF_betas = CAF_results$beta,
+                                  CU_betas = CU_results$beta,
+                                  GLC_betas = GLC_results$beta,
+                                  IGF1_betas = IGF1_results$beta,
+                                  TUNIC_betas = TUNIC_results$beta, 
+                                  VITA_betas = VITA_results$beta)
+counts_comp_corr <- cor(counts_comp_results)
+write.csv(counts_comp_corr, file="/mnt/primevo/work/christian_gagnon/Ape_GxE_comparative/bulkRNAapes/data/counts_comp_corr.csv")
+corrplot(counts_comp_corr, type = 'upper')
+```
+
+```{r}
+## genes diff expressed across species ----
+# generating a function
+species_differences <- function(treatment_results, treatment_name, control_matrix, control_type){
+  treatment_sig <- rownames(treatment_results[treatment_results$adj.pval < 0.05, ])
+  treatment_counts_comp <- norm_expression %>%
+    filter(row.names(norm_expression) %in% treatment_sig)
+  treatment_counts_comp <- treatment_counts_comp %>%
+    dplyr::select(contains(treatment_name))
+  treatment_counts_comp <- merge(treatment_counts_comp, control_matrix, by = "row.names")
+  rownames(treatment_counts_comp) <- treatment_counts_comp$Row.names
+  treatment_counts_comp <- treatment_counts_comp[,-1]
+  
+  treatment_counts_comp_diff <- data.frame(row.names = rownames(treatment_counts_comp),
+                                           Janet = treatment_counts_comp[[paste0("Janet", treatment_name)]] - treatment_counts_comp[[paste0("Janet", control_type)]],
+                                           Toba = treatment_counts_comp[[paste0("Toba", treatment_name)]] - treatment_counts_comp[[paste0("Toba", control_type)]],
+                                           Maisko = treatment_counts_comp[[paste0("Maisko", treatment_name)]] - treatment_counts_comp[[paste0("Maisko", control_type)]],
+                                           Walter = treatment_counts_comp[[paste0("Walter", treatment_name)]] - treatment_counts_comp[[paste0("Walter", control_type)]],
+                                           Ulindi = treatment_counts_comp[[paste0("Ulindi", treatment_name)]] - treatment_counts_comp[[paste0("Ulindi", control_type)]],
+                                           Effi = treatment_counts_comp[[paste0("Effi", treatment_name)]] - treatment_counts_comp[[paste0("Effi", control_type)]],
+                                           Limbuko = treatment_counts_comp[[paste0("Limbuko", treatment_name)]] - treatment_counts_comp[[paste0("Limbuko", control_type)]],
+                                           Murphy = treatment_counts_comp[[paste0("Murphy", treatment_name)]] - treatment_counts_comp[[paste0("Murphy", control_type)]])
+  #treatment_counts_comp_diff <- abs(treatment_counts_comp_diff)
+  
+  treatment_counts_comp_diff$chimp_avg <- rowMeans(treatment_counts_comp_diff[, c("Janet", "Maisko")], na.rm = TRUE)
+  treatment_counts_comp_diff$bonobo_avg <- rowMeans(treatment_counts_comp_diff[, c("Ulindi", "Limbuko")], na.rm = TRUE)
+  treatment_counts_comp_diff$gorilla_avg <- rowMeans(treatment_counts_comp_diff[,c("Effi", "Murphy")], na.rm = TRUE)
+  treatment_counts_comp_diff$orang_avg <- rowMeans(treatment_counts_comp_diff[,c("Toba", "Walter")], na.rm = TRUE)
+  
+  return(treatment_counts_comp_diff)
+}
+```
+
+```{r}
+for (treatment in CO1_treatments) {
+  treatment_results <- paste0(treatment, "_results")
+  treatment_results <- get(treatment_results)
+  
+  output_df <- species_differences(treatment_results, treatment, CO1_counts_norm, 'CO1')
+  
+  assign(paste0(treatment, "_diff"), output_df)
+}
+```
+
+```{r}
+for (treatment in CO2_treatments) {
+  treatment_results <- paste0(treatment, "_results")
+  treatment_results <- get(treatment_results)
+  
+  output_df <- species_differences(treatment_results, treatment, CO2_counts_norm, 'CO2')
+  
+  assign(paste0(treatment, "_diff"), output_df)
+}
+```
+
+```{r}
+# plotting these results
+# making a function for it
+diff_plots <- function(treatment_diff){
+  treatment_diff$genes <- rownames(treatment_diff)
+  treatment_diff2 <- treatment_diff %>%
+    pivot_longer(cols = c("Janet", "Toba", "Maisko", "Walter", "Ulindi", "Effi", "Limbuko", "Murphy"),
+                 names_to = "individual",
+                 values_to = "expression")
+  treatment_diff2 <- treatment_diff2[,5:7]
+  treatment_diff2$species <- NA
+  treatment_diff2$species <- ifelse(treatment_diff2$individual %in% c("Janet", "Maisko"), "chimp", treatment_diff2$species)
+  treatment_diff2$species <- ifelse(treatment_diff2$individual %in% c("Ulindi", "Limbuko"), "bonobo", treatment_diff2$species)
+  treatment_diff2$species <- ifelse(treatment_diff2$individual %in% c("Effi", "Murphy"), "gorilla", treatment_diff2$species)
+  treatment_diff2$species <- ifelse(treatment_diff2$individual %in% c("Toba", "Walter"), "orang", treatment_diff2$species)
+  
+  
+  treatment_plot_diff <- ggplot(data = treatment_diff2, aes(x = individual, y = expression, fill = species)) +
+    geom_violin(trim = TRUE, alpha = 0.6) +
+    geom_boxplot(alpha = 0.85, width = 0.2, outliers = FALSE) +
+    scale_x_discrete(limits = c("Janet", "Maisko", "Ulindi", "Limbuko", "Effi", "Murphy", "Toba", "Walter")) +
+    theme_classic(base_size = 15) +
+    scale_fill_manual(values = c("lightskyblue", "palegreen", "seagreen", "dodgerblue3")) +
+    xlab("Individual") +
+    ylab("Difference in Gene Expression") +
+    theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1)) +
+    ylim(-2,2) +
+    geom_hline(yintercept = 0, linetype = 'dashed')
+  
+  return(treatment_plot_diff)
+}
+```
+
+```{r}
+# running the function through a loop
+for (treatment in treatments) {
+  treatment_diff <- paste0(treatment, "_diff")
+  treatment_diff <- get(treatment_diff)
+  
+  treatment_plot_diff <- diff_plots(treatment_diff)
+  
+  assign(paste0(treatment, "_plot_diff"), treatment_plot_diff)
+}
+```
+
+```{r}
+# opening the plots
+plot(ALD_plot_diff)
+plot(APAP_plot_diff)
+plot(BAFF_plot_diff)
+plot(BPA_plot_diff)
+plot(CAF_plot_diff)
+plot(CU_plot_diff)
+plot(GLC_plot_diff)
+plot(IGF1_plot_diff)
+plot(TUNIC_plot_diff)
+```
+
+```{r}
+## pairwise t test analyses on matched sig genes ----
+# ALD
+sig_ALD <- ALD_results %>%
+  filter(adj.pval < 0.05)
+sig_ALD$gene <- rownames(sig_ALD)
+sig_ALD <- as.data.frame(sig_ALD[,c(2,6)])
+colnames(sig_ALD) <- c("ALD_beta", "gene")
+
+# APAP
+sig_APAP <- APAP_results %>%
+  filter(adj.pval < 0.05)
+sig_APAP$gene <- rownames(sig_APAP)
+sig_APAP <- as.data.frame(sig_APAP[,c(2,6)])
+colnames(sig_APAP) <- c("APAP_beta", "gene")
+
+# BAFF
+sig_BAFF <- BAFF_results %>%
+  filter(adj.pval < 0.05)
+sig_BAFF$gene <- rownames(sig_BAFF)
+sig_BAFF <- as.data.frame(sig_BAFF[,c(2,6)])
+colnames(sig_BAFF) <- c("BAFF_beta", "gene")
+
+# BPA
+sig_BPA <- BPA_results %>%
+  filter(adj.pval < 0.05)
+sig_BPA$gene <- rownames(sig_BPA)
+sig_BPA <- as.data.frame(sig_BPA[,c(2,6)])
+colnames(sig_BPA) <- c("BPA_beta", "gene")
+
+# CAF
+sig_CAF <- CAF_results %>%
+  filter(adj.pval < 0.05)
+sig_CAF$gene <- rownames(sig_CAF)
+sig_CAF <- as.data.frame(sig_CAF[,c(2,6)])
+colnames(sig_CAF) <- c("CAF_beta", "gene")
+
+# CU
+sig_CU <- CU_results %>%
+  filter(adj.pval < 0.05)
+sig_CU$gene <- rownames(sig_CU)
+sig_CU <- as.data.frame(sig_CU[,c(2,6)])
+colnames(sig_CU) <- c("CU_beta", "gene")
+
+# GLC
+sig_GLC <- GLC_results %>%
+  filter(adj.pval < 0.05)
+sig_GLC$gene <- rownames(sig_GLC)
+sig_GLC <- as.data.frame(sig_GLC[,c(2,6)])
+colnames(sig_GLC) <- c("GLC_beta", "gene")
+
+# IGF1
+sig_IGF1 <- IGF1_results %>%
+  filter(adj.pval < 0.05)
+sig_IGF1$gene <- rownames(sig_IGF1)
+sig_IGF1 <- as.data.frame(sig_IGF1[,c(2,6)])
+colnames(sig_IGF1) <- c("IGF1_beta", "gene")
+
+# TUNIC
+sig_TUNIC <- TUNIC_results %>%
+  filter(adj.pval < 0.05)
+sig_TUNIC$gene <- rownames(sig_TUNIC)
+sig_TUNIC <- as.data.frame(sig_TUNIC[,c(2,6)])
+colnames(sig_TUNIC) <- c("TUNIC_beta", "gene")
+```
+
+```{r}
+# ALD v APAP
+t.test(sig_ALD$ALD_beta, sig_APAP$APAP_beta)
+
+# ALD v BAFF
+t.test(sig_ALD$ALD_beta, sig_BAFF$BAFF_beta)
+
+# ALD v BPA
+t.test(sig_ALD$ALD_beta, sig_BPA$BPA_beta)
+
+# ALD v CAF
+t.test(sig_ALD$ALD_beta, sig_CAF$CAF_beta)
+
+# ALD v CU
+t.test(sig_ALD$ALD_beta, sig_CU$CU_beta)
+
+# ALD v GLC
+t.test(sig_ALD$ALD_beta, sig_GLC$GLC_beta)
+
+# ALD v IGF1
+t.test(sig_ALD$ALD_beta, sig_IGF1$IGF1_beta)
+
+# ALD v TUNIC
+t.test(sig_ALD$ALD_beta, sig_TUNIC$TUNIC_beta)
+
+# APAP v BAFF
+t.test(sig_APAP$APAP_beta, sig_BAFF$BAFF_beta)
+
+# APAP v BPA
+t.test(sig_APAP$APAP_beta, sig_BPA$BPA_beta)
+
+# APAP v CAF
+t.test(sig_APAP$APAP_beta, sig_CAF$CAF_beta)
+
+# APAP v CU
+t.test(sig_APAP$APAP_beta, sig_CU$CU_beta)
+
+# APAP v GLC
+t.test(sig_APAP$APAP_beta, sig_GLC$GLC_beta)
+
+# APAP v IGF1
+t.test(sig_APAP$APAP_beta, sig_IGF1$IGF1_beta)
+
+# APAP v TUNIC
+t.test(sig_APAP$APAP_beta, sig_TUNIC$TUNIC_beta)
+
+# BAFF v BPA
+t.test(sig_BAFF$BAFF_beta, sig_BPA$BPA_beta)
+
+# BAFF v CAF
+t.test(sig_BAFF$BAFF_beta, sig_CAF$CAF_beta)
+
+# BAFF v CU
+t.test(sig_BAFF$BAFF_beta, sig_CU$CU_beta)
+
+# BAFF v GLC
+t.test(sig_BAFF$BAFF_beta, sig_GLC$GLC_beta)
+
+# BAFF v IGF1
+t.test(sig_BAFF$BAFF_beta, sig_IGF1$IGF1_beta)
+
+# BAFF v TUNIC
+t.test(sig_BAFF$BAFF_beta, sig_TUNIC$TUNIC_beta)
+
+# BPA v CAF
+t.test(sig_BPA$BPA_beta, sig_CAF$CAF_beta)
+
+# BPA v CU
+t.test(sig_BPA$BPA_beta, sig_CU$CU_beta)
+
+# BPA v GLC
+t.test(sig_BPA$BPA_beta, sig_GLC$GLC_beta)
+
+# BPA v IGF1
+t.test(sig_BPA$BPA_beta, sig_IGF1$IGF1_beta)
+
+# BPA v TUNIC
+t.test(sig_BPA$BPA_beta, sig_TUNIC$TUNIC_beta)
+
+# CAF v CU
+t.test(sig_CAF$CAF_beta, sig_CU$CU_beta)
+
+# CAF v GLC
+t.test(sig_CAF$CAF_beta, sig_GLC$GLC_beta)
+
+# CAF v IGF1
+t.test(sig_CAF$CAF_beta, sig_IGF1$IGF1_beta)
+
+# CAF v TUNIC
+t.test(sig_CAF$CAF_beta, sig_TUNIC$TUNIC_beta)
+
+# CU v GLC
+t.test(sig_CU$CU_beta, sig_GLC$GLC_beta)
+
+# CU v IGF1
+t.test(sig_CU$CU_beta, sig_IGF1$IGF1_beta)
+
+# CU v TUNIC
+t.test(sig_CU$CU_beta, sig_TUNIC$TUNIC_beta)
+
+# GLC v IGF1
+t.test(sig_GLC$GLC_beta, sig_IGF1$IGF1_beta)
+
+# GLC v TUNIC
+t.test(sig_GLC$GLC_beta, sig_TUNIC$TUNIC_beta)
+
+# IGF1 v TUNIC
+t.test(sig_IGF1$IGF1_beta, sig_TUNIC$TUNIC_beta)
+```
+
+```{r}
+## looking into the VITA results matrix ----
+#ulindi is not present in this matrix
+VITA_results3 <- VITA_results %>%
+  arrange(p.value) %>%
+  slice(1:100)
+
+treatment_sig <- rownames(VITA_results3)
+treatment_counts_comp <- norm_expression %>%
+  filter(row.names(norm_expression) %in% treatment_sig)
+treatment_counts_comp <- treatment_counts_comp %>%
+  dplyr::select(contains('VITA'))
+treatment_counts_comp <- merge(treatment_counts_comp, CO2_counts_norm, by = "row.names")
+rownames(treatment_counts_comp) <- treatment_counts_comp$Row.names
+treatment_counts_comp <- treatment_counts_comp[,-1]
+
+treatment_counts_comp_diff <- data.frame(row.names = rownames(treatment_counts_comp),
+                                         Janet = treatment_counts_comp$JanetVITA - treatment_counts_comp$JanetCO2,
+                                         Toba = treatment_counts_comp$TobaVITA - treatment_counts_comp$TobaCO2,
+                                         Maisko = treatment_counts_comp$MaiskoVITA - treatment_counts_comp$MaiskoCO2,
+                                         Walter = treatment_counts_comp$WalterVITA - treatment_counts_comp$WalterCO2,
+                                         Effi = treatment_counts_comp$EffiVITA - treatment_counts_comp$EffiCO2,
+                                         Limbuko = treatment_counts_comp$LimbukoVITA - treatment_counts_comp$LimbukoCO2,
+                                         Murphy = treatment_counts_comp$MurphyVITA - treatment_counts_comp$MurphyCO2)
+
+treatment_counts_comp_diff$chimp_avg <- rowMeans(treatment_counts_comp_diff[, c("Janet", "Maisko")], na.rm = TRUE)
+#treatment_counts_comp_diff$bonobo_avg <- rowMeans(treatment_counts_comp_diff[, c("Limbuko")], na.rm = TRUE)
+treatment_counts_comp_diff$gorilla_avg <- rowMeans(treatment_counts_comp_diff[,c("Effi", "Murphy")], na.rm = TRUE)
+treatment_counts_comp_diff$orang_avg <- rowMeans(treatment_counts_comp_diff[,c("Toba", "Walter")], na.rm = TRUE)
+
+VITA_diff <- treatment_counts_comp_diff
+
+VITA_diff$genes <- rownames(VITA_diff)
+VITA_diff2 <- VITA_diff %>%
+  pivot_longer(cols = c("Janet", "Toba", "Maisko", "Walter", "Effi", "Limbuko", "Murphy"),
+               names_to = "individual",
+               values_to = "expression")
+VITA_diff2 <- VITA_diff2[,4:6]
+VITA_diff2$species <- NA
+VITA_diff2$species <- ifelse(VITA_diff2$individual %in% c("Janet", "Maisko"), "chimp", VITA_diff2$species)
+VITA_diff2$species <- ifelse(VITA_diff2$individual %in% c("Limbuko"), "bonobo", VITA_diff2$species)
+VITA_diff2$species <- ifelse(VITA_diff2$individual %in% c("Effi", "Murphy"), "gorilla", VITA_diff2$species)
+VITA_diff2$species <- ifelse(VITA_diff2$individual %in% c("Toba", "Walter"), "orang", VITA_diff2$species)
+
+
+ggplot(data = VITA_diff2, aes(x = individual, y = expression, fill = species)) +
+  geom_violin(trim = TRUE, alpha = 0.6) +
+  geom_boxplot(alpha = 0.85, width = 0.2, outliers = FALSE) +
+  scale_x_discrete(limits = c("Janet", "Maisko", "Limbuko", "Effi", "Murphy", "Toba", "Walter")) +
+  theme_classic(base_size = 15) +
+  scale_fill_manual(values = c("lightskyblue", "palegreen", "seagreen", "dodgerblue3")) +
+  xlab("Individual") +
+  ylab("Difference in Gene Expression") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1)) +
+  geom_hline(yintercept = 0, linetype = 'dashed')
+```
+
+```{r}
+# comparing VITA from counts_comp to VITA from counts_intra
+VITA_results_comp <- VITA_results
+VITA_results_intra <- VITA_results
+VITA_results_combined <- merge(VITA_results_comp, VITA_results_intra, by = 'row.names')
+  #share 9726 genes
+smoothScatter(VITA_results_combined$beta.x, VITA_results_combined$beta.y, nrpoints = 1000,
+              xlab = 'counts_comp beta', ylab = 'counts_intra beta')
+abline(0, 1, lty = 2)
+
+summary(lm(VITA_results_combined$beta.x ~ VITA_results_combined$beta.y))
+  # R-squared: -6.21 x 10^-05
+
+ggplot(data = VITA_results_combined) +
+  geom_density(aes(beta.x), fill = "mediumpurple1", alpha = 0.5) +
+  geom_density(aes(beta.y), fill = "coral", alpha = 0.5) +
+  theme_classic(base_size = 15) +
+  xlab("Beta") +
+  ylab("Density") +
+  labs(title = "counts_comp (purple), counts_intra (orange)")
+```
+
+```{r}
+###### taking the significant genes from vita in counts_intra
+vita_intra_sig <- read.delim('~/Documents/vandy/LCL GxE pilot/vita_intra_sig_genes.txt', sep = " ")
+colnames(vita_intra_sig) <- "gene"
+  # 1,227 genes
+
+VITA_results_new <- VITA_results %>%
+  filter(row.names(VITA_results) %in% vita_intra_sig$gene)
+  # 1,089 genes
+
+treatment_sig <- rownames(VITA_results_new)
+treatment_counts_comp <- norm_expression %>%
+  filter(row.names(norm_expression) %in% treatment_sig)
+treatment_counts_comp <- treatment_counts_comp %>%
+  dplyr::select(contains('VITA'))
+treatment_counts_comp <- merge(treatment_counts_comp, CO2_counts_norm, by = "row.names")
+rownames(treatment_counts_comp) <- treatment_counts_comp$Row.names
+treatment_counts_comp <- treatment_counts_comp[,-1]
+
+treatment_counts_comp_diff <- data.frame(row.names = rownames(treatment_counts_comp),
+                                         Janet = treatment_counts_comp$JanetVITA - treatment_counts_comp$JanetCO2,
+                                         Toba = treatment_counts_comp$TobaVITA - treatment_counts_comp$TobaCO2,
+                                         Maisko = treatment_counts_comp$MaiskoVITA - treatment_counts_comp$MaiskoCO2,
+                                         Walter = treatment_counts_comp$WalterVITA - treatment_counts_comp$WalterCO2,
+                                         Effi = treatment_counts_comp$EffiVITA - treatment_counts_comp$EffiCO2,
+                                         Limbuko = treatment_counts_comp$LimbukoVITA - treatment_counts_comp$LimbukoCO2,
+                                         Murphy = treatment_counts_comp$MurphyVITA - treatment_counts_comp$MurphyCO2)
+
+treatment_counts_comp_diff$chimp_avg <- rowMeans(treatment_counts_comp_diff[, c("Janet", "Maisko")], na.rm = TRUE)
+#treatment_counts_comp_diff$bonobo_avg <- rowMeans(treatment_counts_comp_diff[, c("Limbuko")], na.rm = TRUE)
+treatment_counts_comp_diff$gorilla_avg <- rowMeans(treatment_counts_comp_diff[,c("Effi", "Murphy")], na.rm = TRUE)
+treatment_counts_comp_diff$orang_avg <- rowMeans(treatment_counts_comp_diff[,c("Toba", "Walter")], na.rm = TRUE)
+
+VITA_diff <- treatment_counts_comp_diff
+
+VITA_diff$genes <- rownames(VITA_diff)
+VITA_diff2 <- VITA_diff %>%
+  pivot_longer(cols = c("Janet", "Toba", "Maisko", "Walter", "Effi", "Limbuko", "Murphy"),
+               names_to = "individual",
+               values_to = "expression")
+VITA_diff2 <- VITA_diff2[,4:6]
+VITA_diff2$species <- NA
+VITA_diff2$species <- ifelse(VITA_diff2$individual %in% c("Janet", "Maisko"), "chimp", VITA_diff2$species)
+VITA_diff2$species <- ifelse(VITA_diff2$individual %in% c("Limbuko"), "bonobo", VITA_diff2$species)
+VITA_diff2$species <- ifelse(VITA_diff2$individual %in% c("Effi", "Murphy"), "gorilla", VITA_diff2$species)
+VITA_diff2$species <- ifelse(VITA_diff2$individual %in% c("Toba", "Walter"), "orang", VITA_diff2$species)
+
+ggplot(data = VITA_diff2, aes(x = individual, y = expression, fill = species)) +
+  geom_violin(trim = TRUE, alpha = 0.6) +
+  geom_boxplot(alpha = 0.85, width = 0.2, outliers = FALSE) +
+  scale_x_discrete(limits = c("Janet", "Maisko", "Limbuko", "Effi", "Murphy", "Toba", "Walter")) +
+  theme_classic(base_size = 15) +
+  scale_fill_manual(values = c("lightskyblue", "palegreen", "seagreen", "dodgerblue3")) +
+  xlab("Individual") +
+  ylab("Difference in Gene Expression") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1)) +
+  geom_hline(yintercept = 0, linetype = 'dashed')
+```
+
+
+
+
+#####Obsolete#####
+
+```{r}
+# density plots of the beta values
+ALD_vs_APAP_betas <- data.frame(ALD = ALD_results[,2],
+                          APAP = APAP_results[,2],
+                          row.names = rownames(ALD_results))
+cor_ALD_vs_APAP <- cor(ALD_vs_APAP_betas)
+  # correlation of betas between ACRYL1 and ACRYL2 is 0.643
+corrplot(cor_ALD_vs_APAP)
+
+ggplot(ALD_vs_APAP_betas) +
+  geom_density(fill = "mediumpurple1", alpha = 0.5, aes(ALD)) +
+  geom_density(fill = "coral", alpha = 0.5, aes(APAP)) +
+  theme_classic(base_size = 20) +
+  xlab("Beta value") +
+  ylab("Density") +
+  labs(title = "ALD vs APAP")
+```
+
+
+```{r}
+new_df <- data.frame(beta_ALD = ALD_results$beta, beta_APAP = APAP_results$beta)
+ggplot(new_df, aes((x = beta_ALD + geom_point(color="blue")), (y = beta_APAP)) + geom_point() + 
+  geom_smooth(method=lm, se=FALSE) +
+  xlab('ALD_beta') + ylab('APAP_beta') +
+  theme(axis.title.x = element_text(color ='red'), axis.title.y = element_text(color = 'blue')))
+
+```
+
+
+
+```{r}
+#DGE by taxon
+
+#first we make df for each treatment by taxon
+
+new_chimp_df <- data.frame(Maisko_CO1 = counts_comp3$MaiskoCO1, 
+                           Janet_CO1 = counts_comp3$JanetCO1,
+                           Maisko_ALD = counts_comp3$MaiskoALD, 
+                           Janet_ALD = counts_comp3$JanetALD, 
+                           Maisko_APAP = counts_comp3$MaiskoAPAP, 
+                           Janet_APAP = counts_comp3$JanetAPAP, 
+                           Maisko_BAFF = counts_comp3$MaiskoBAFF, 
+                           Janet_BAFF = counts_comp3$JanetBAFF, 
+                           Maisko_BPA = counts_comp3$MaiskoBPA, 
+                           Janet_BPA = counts_comp3$JanetBPA, 
+                           Maisko_CAF = counts_comp3$MaiskoCAF, 
+                           Janet_CAF = counts_comp3$JanetCAF,
+                           Maisko_CO2 = counts_comp3$MaiskoCO2, 
+                           Janet_CO2 = counts_comp3$JanetCO2,
+                           Maisko_CU = counts_comp3$MaiskoCU, 
+                           Janet_CU = counts_comp3$JanetCU, 
+                           Maisko_GLC = counts_comp3$MaiskoGLC, 
+                           Janet_GLC = counts_comp3$JanetGLC,
+                           Maisko_IGF1 = counts_comp3$MaiskoIGF1, 
+                           Janet_IGF1 = counts_comp3$JanetIGF1,
+                           Maisko_TUNIC = counts_comp3$MaiskoTUNIC, 
+                           Janet_TUNIC = counts_comp3$JanetTUNIC,
+                           Maisko_VITA = counts_comp3$MaiskoVITA, 
+                           Janet_VITA = counts_comp3$JanetVITA)
+row.names(new_chimp_df) <- row.names(counts_comp3)
+
+lcl_metadata_chimp <- lcl_metadata2[c(24:47),]
+row.names(lcl_metadata_chimp) <- row.names(c(1:24))
+
+
+new_bonobo_df <- data.frame(Limbuko_CO1 = counts_comp3$LimbukoCO1, 
+                           Ulindi_CO1 = counts_comp3$UlindiCO1,
+                           Limbuko_ALD = counts_comp3$LimbukoALD, 
+                           Ulindi_ALD = counts_comp3$UlindiALD, 
+                           Limbuko_APAP = counts_comp3$LimbukoAPAP, 
+                           Ulindi_APAP = counts_comp3$UlindiAPAP, 
+                           Limbuko_BAFF = counts_comp3$LimbukoBAFF, 
+                           Ulindi_BAFF = counts_comp3$UlindiBAFF, 
+                           Limbuko_BPA = counts_comp3$LimbukoBPA, 
+                           Ulindi_BPA = counts_comp3$UlindiBPA, 
+                           Limbuko_CAF = counts_comp3$LimbukoCAF, 
+                           Ulindi_CAF = counts_comp3$UlindiCAF,
+                           Limbuko_CO2 = counts_comp3$LimbukoCO2, 
+                           Ulindi_CO2 = counts_comp3$UlindiCO2,
+                           Limbuko_CU = counts_comp3$LimbukoCU, 
+                           Ulindi_CU = counts_comp3$UlindiCU, 
+                           Limbuko_GLC = counts_comp3$LimbukoGLC, 
+                           Ulindi_GLC = counts_comp3$UlindiGLC,
+                           Limbuko_IGF1 = counts_comp3$LimbukoIGF1, 
+                           Ulindi_IGF1 = counts_comp3$UlindiIGF1,
+                           Limbuko_TUNIC = counts_comp3$LimbukoTUNIC, 
+                           Ulindi_TUNIC = counts_comp3$UlindiTUNIC)
+row.names(new_bonobo_df) <- row.names(counts_comp3)
+
+lcl_metadata_bonobo <- lcl_metadata2[c(1:19,21:23),]
+row.names(lcl_metadata_bonobo) <- row.names(c(1:22))
+
+new_gorilla_df <- data.frame(Murphy_CO1 = counts_comp3$MurphyCO1, 
+                           Effi_CO1 = counts_comp3$EffiCO1,
+                           Murphy_ALD = counts_comp3$MurphyALD, 
+                           Effi_ALD = counts_comp3$EffiALD, 
+                           Murphy_APAP = counts_comp3$MurphyAPAP, 
+                           Effi_APAP = counts_comp3$EffiAPAP, 
+                           Murphy_BAFF = counts_comp3$MurphyBAFF, 
+                           Effi_BAFF = counts_comp3$EffiBAFF, 
+                           Murphy_BPA = counts_comp3$MurphyBPA, 
+                           Effi_BPA = counts_comp3$EffiBPA, 
+                           Murphy_CAF = counts_comp3$MurphyCAF, 
+                           Effi_CAF = counts_comp3$EffiCAF,
+                           Murphy_CO2 = counts_comp3$MurphyCO2, 
+                           Effi_CO2 = counts_comp3$EffiCO2,
+                           Murphy_CU = counts_comp3$MurphyCU, 
+                           Effi_CU = counts_comp3$EffiCU, 
+                           Murphy_GLC = counts_comp3$MurphyGLC, 
+                           Effi_GLC = counts_comp3$EffiGLC,
+                           Murphy_IGF1 = counts_comp3$MurphyIGF1, 
+                           Effi_IGF1 = counts_comp3$EffiIGF1,
+                           Murphy_TUNIC = counts_comp3$MurphyTUNIC, 
+                           Effi_TUNIC = counts_comp3$EffiTUNIC,
+                           Murphy_VITA = counts_comp3$MurphyVITA, 
+                           Effi_VITA = counts_comp3$EffiVITA)
+row.names(new_gorilla_df) <- row.names(counts_comp3)
+
+lcl_metadata_gorilla <- lcl_metadata2[c(48:71),]
+row.names(lcl_metadata_gorilla) <- row.names(c(1:24))
+
+new_orang_df <- data.frame(Walter_CO1 = counts_comp3$WalterCO1, 
+                           Toba_CO1 = counts_comp3$TobaCO1,
+                           Walter_ALD = counts_comp3$WalterALD, 
+                           Toba_ALD = counts_comp3$TobaALD, 
+                           Walter_APAP = counts_comp3$WalterAPAP, 
+                           Toba_APAP = counts_comp3$TobaAPAP, 
+                           Walter_BAFF = counts_comp3$WalterBAFF, 
+                           Toba_BAFF = counts_comp3$TobaBAFF, 
+                           Walter_BPA = counts_comp3$WalterBPA, 
+                           Toba_BPA = counts_comp3$TobaBPA, 
+                           Walter_CAF = counts_comp3$WalterCAF, 
+                           Toba_CAF = counts_comp3$TobaCAF,
+                           Walter_CO2 = counts_comp3$WalterCO2, 
+                           Toba_CO2 = counts_comp3$TobaCO2,
+                           Walter_CU = counts_comp3$WalterCU, 
+                           Toba_CU = counts_comp3$TobaCU, 
+                           Walter_GLC = counts_comp3$WalterGLC, 
+                           Toba_GLC = counts_comp3$TobaGLC,
+                           Walter_IGF1 = counts_comp3$WalterIGF1, 
+                           Toba_IGF1 = counts_comp3$TobaIGF1,
+                           Walter_TUNIC = counts_comp3$WalterTUNIC, 
+                           Toba_TUNIC = counts_comp3$TobaTUNIC,
+                           Walter_VITA = counts_comp3$WalterVITA, 
+                           Toba_VITA = counts_comp3$TobaVITA)
+row.names(new_orang_df) <- row.names(counts_comp3)
+
+lcl_metadata_orang <- lcl_metadata2[c(72:95),]
+row.names(lcl_metadata_orang) <- row.names(c(1:24))
+```
+
+```{r}
+DGEanalysis <- function(counts_matrix, metadata) {
+  dge2 <- DGEList(counts_matrix)
+  dge2 <- calcNormFactors(dge2)
+  model <- model.matrix(~treatment+sex, data = metadata)
+  v <- voom(dge2, model, plot = F)
+  fit <- lmFit(v, model)
+  fit <- eBayes(fit)
+  p.values <- as.data.frame(fit$p.value[,2])
+  betas <- as.data.frame(fit$coefficients[,2])
+  SEs <- as.data.frame(fit$stdev.unscaled[,2]*fit$sigma)
+  results <- cbind(p.values, betas, SEs)
+  colnames(results) <- c("p.value", "beta", "SE")
+  results$adj.pval <- p.adjust(results$p.value, method = "BH")
+  results$sig <- ifelse(results$adj.pval < 0.10, "sig", "not_sig")
+  
+  row.names(results) <- row.names(counts_comp3)
+  
+dge_chimp <- DGEList(new_chimp_df)
+dge_chimp <- calcNormFactors(new_chimp_df)
+snames_chimp <- colnames(new_chimp_df)
+individual_chimp <- c("Maisko", "Janet") 
+group <- interaction(individual_chimp, treatment)
+  model <- model.matrix(~treatment+sex, data = lcl_metadata_chimp)
+  v_chimp <- voom(dge_chimp, model, plot = F)
+  fit_chimp <- lmFit(v_chimp, model)
+  fit_chimp <- eBayes(fit_chimp)
+  p.values_chimp <- as.data.frame(fit_chimp$p.value[,2])
+  betas_chimp <- as.data.frame(fit_chimp$coefficients[,2])
+  SEs_chimp <- as.data.frame(fit_chimp$stdev.unscaled[,2]*fit_chimp$sigma)
+  results_chimp <- cbind(p.values_chimp, betas_chimp, SEs_chimp)
+  colnames(results_chimp) <- c("p.value", "beta", "SE")
+  results_chimp$adj.pval <- p.adjust(results_chimp$p.value, method = "BH")
+  results_chimp$sig <- ifelse(results_chimp$adj.pval < 0.10, "sig", "not_sig")
+  
+  row.names(results_chimp) <- row.names(counts_comp3)
+  
+  return(results_chimp)
+  
+dge_bonobo <- DGEList(new_bonobo_df)
+dge_bonobo <- calcNormFactors(new_bonobo_df)
+  model <- model.matrix(~treatment, data = metadata)
+  v_bonobo <- voom(dge_bonobo, model, plot = F)
+  fit_bonobo <- lmFit(v_bonobo, model)
+  fit_bonobo <- eBayes(fit_bonobo)
+  p.values_bonobo <- as.data.frame(fit_bonobo$p.value[,2])
+  betas_bonobo <- as.data.frame(fit_bonobo$coefficients[,2])
+  SEs_bonobo <- as.data.frame(fit_bonobo$stdev.unscaled[,2]*fit_bonobo$sigma)
+  results_bonobo <- cbind(p.values_bonobo, betas_bonobo, SEs_bonobo)
+  colnames(results_bonobo) <- c("p.value", "beta", "SE")
+  results_bonobo$adj.pval <- p.adjust(results_bonobo$p.value, method = "BH")
+  results_bonobo$sig <- ifelse(results_bonobo$adj.pval < 0.10, "sig", "not_sig")
+  
+  row.names(results_bonobo) <- row.names(counts_comp3)
+  
+  return(results_bonobo)
+  
+dge_orangutan <- DGEList(new_orang_df)
+dge_orangutan <- calcNormFactors(new_orang_df)
+  model <- model.matrix(~treatment, data = metadata)
+  v_orangutan <- voom(dge_orangutan, model, plot = F)
+  fit_orangutan <- lmFit(v_orangutan, model)
+  fit_orangutan <- eBayes(fit_orangutan)
+  p.values_orangutan <- as.data.frame(fit_orangutan$p.value[,2])
+  betas_orangutan <- as.data.frame(fit_orangutan$coefficients[,2])
+  SEs_orangutan <- as.data.frame(fit_orangutan$stdev.unscaled[,2]*fit_orangutan$sigma)
+  results_orangutan <- cbind(p.values_orangutan, betas_orangutan, SEs_orangutan)
+  colnames(results_orangutan) <- c("p.value", "beta", "SE")
+  results_orangutan$adj.pval <- p.adjust(results_orangutan$p.value, method = "BH")
+  results_orangutan$sig <- ifelse(results_orangutan$adj.pval < 0.10, "sig", "not_sig")
+  
+  row.names(results_orangutan) <- row.names(counts_comp3)
+  
+  return(results_orangutan)
+  
+dge_gorilla <- DGEList(new_gorilla_df)
+dge_gorilla <- calcNormFactors(new_gorilla_df)
+  model <- model.matrix(~treatment, data = metadata)
+  v_gorilla <- voom(dge_gorilla, model, plot = F)
+  fit_gorilla <- lmFit(v_gorilla, model)
+  fit_gorilla <- eBayes(fit_gorilla)
+  p.values_gorilla <- as.data.frame(fit_gorilla$p.value[,2])
+  betas_gorilla <- as.data.frame(fit_gorilla$coefficients[,2])
+  SEs_gorilla <- as.data.frame(fit_gorilla$stdev.unscaled[,2]*fit_gorilla$sigma)
+  results_gorilla <- cbind(p.values_gorilla, betas_gorilla, SEs_gorilla)
+  colnames(results_gorilla) <- c("p.value", "beta", "SE")
+  results_gorilla$adj.pval <- p.adjust(results_gorilla$p.value, method = "BH")
+  results_gorilla$sig <- ifelse(results_gorilla$adj.pval < 0.10, "sig", "not_sig")
+  
+  row.names(results_gorilla) <- row.names(counts_comp3)
+  
+  return(results_gorilla)
+```
+
+ggplot(new_df, aes((x = beta_CU + geom_point(color="blue")), (y = beta_APAP)) + geom_point() + 
+  geom_smooth(method=lm, se=FALSE) +
+  xlab('CU_beta') + ylab('APAP_beta') +
+  theme(axis.title.x = element_text(color ='red'), axis.title.y = element_text(color = 'blue')))
+
